@@ -1,0 +1,50 @@
+name: Build store-front image to ACR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to push"
+        required: true
+        default: "stage11-v1"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build and push store-front
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@v4
+
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push store-front image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src/store-front
+          push: true
+          platforms: linux/amd64
+          tags: ${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}
+
+      - name: Verify image tag in ACR
+        run: |
+          az acr repository show-tags \
+            --name ${{ vars.ACR_NAME }} \
+            --repository store-front \
+            --output table
