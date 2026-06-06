@@ -4,22 +4,40 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to build, push, and deploy to Dev"
+        description: "Image tag to build, scan, push, and deploy to Dev"
         required: true
-        default: "stage12-v1"
+        default: "stage13-v1"
 
 permissions:
   id-token: write
   contents: read
+  security-events: write
 
 jobs:
-  build-push-update-gitops:
-    name: Build, push, and update GitOps Dev
+  build-scan-push-update-gitops:
+    name: Build, scan, push, and update GitOps Dev
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout app source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret scan with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Filesystem and dependency scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
 
       - name: Azure login with OIDC
         uses: azure/login@v2
@@ -41,6 +59,15 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: ${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}
+
+      - name: Container image vulnerability scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
 
       - name: Verify image tag in ACR
         run: |
