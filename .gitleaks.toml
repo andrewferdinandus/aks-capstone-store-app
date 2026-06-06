@@ -1,0 +1,8 @@
+title = "Capstone Gitleaks configuration"
+
+[allowlist]
+description = "Allow known upstream AKS Store Demo sample manifests that are not used by the capstone GitOps deployment flow."
+paths = [
+  '''aks-store-all-in-one\.yaml''',
+  '''aks-store-ingress-quickstart\.yaml'''
+]
