@@ -235,21 +235,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          IMAGE="${{ needs.validate-release-input.outputs.image_ref }}"
+          IMAGE_TAG="${{ needs.validate-release-input.outputs.image_tag }}"
+          IMAGE_REF="${{ needs.validate-release-input.outputs.image_ref }}"
           FILE="${{ vars.GITOPS_STORE_FRONT_FILE }}"
 
           echo "Updating ${FILE}"
-          echo "New image: ${IMAGE}"
+          echo "New image ref: ${IMAGE_REF}"
+          echo "New image tag: ${IMAGE_TAG}"
 
           if [[ ! -f "${FILE}" ]]; then
             echo "GitOps file not found: ${FILE}"
             exit 1
           fi
 
-          sed -i -E "s#image: .*/store-front:.*#image: ${IMAGE}#g" "${FILE}"
+          if grep -q "newTag:" "${FILE}"; then
+            sed -i -E "s#newTag: .*#newTag: ${IMAGE_TAG}#g" "${FILE}"
 
-          echo "Updated image line:"
-          grep -n "image: .*store-front" "${FILE}"
+            echo "Updated kustomize image tag:"
+            grep -n "newTag:" "${FILE}"
+          else
+            sed -i -E "s#image: .*/store-front:.*#image: ${IMAGE_REF}#g" "${FILE}"
+
+            echo "Updated direct image line:"
+            grep -n "image: .*store-front" "${FILE}"
+          fi
 
       - name: Commit and push GitOps change
         working-directory: gitops
