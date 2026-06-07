@@ -1,6 +1,6 @@
 name: Build store-front and deploy Dev via GitOps
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       image_tag:
@@ -14,9 +14,46 @@ permissions:
   security-events: write
 
 jobs:
-  build-scan-push-update-gitops:
-    name: Build, scan, push, and update GitOps Dev
+  validate-release-input:
+    name: Validate Release Input
     runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.validate.outputs.image_tag }}
+      image_ref: ${{ steps.validate.outputs.image_ref }}
+
+    steps:
+      - name: Validate image tag
+        id: validate
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+
+          if [[ -z "${IMAGE_TAG}" ]]; then
+            echo "image_tag cannot be empty"
+            exit 1
+          fi
+
+          if [[ ! "${IMAGE_TAG}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "image_tag contains invalid characters: ${IMAGE_TAG}"
+            exit 1
+          fi
+
+          IMAGE_REF="${{ vars.ACR_LOGIN_SERVER }}/store-front:${IMAGE_TAG}"
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+
+          echo "Release input is valid"
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Image ref: ${IMAGE_REF}"
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
 
     steps:
       - name: Checkout app source
@@ -24,14 +61,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Secret scan with Gitleaks
+      - name: Run Gitleaks secret scan
         run: |
+          set -euo pipefail
+
           docker run --rm \
             -v "$PWD:/repo" \
             zricethezav/gitleaks:latest \
             detect --source=/repo --no-git --redact --verbose --config=/repo/.gitleaks.toml
 
-      - name: Filesystem and dependency scan with Trivy
+  source-security-scan:
+    name: Source Security Scan
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem and dependency scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
@@ -41,6 +90,17 @@ jobs:
           format: table
           exit-code: "1"
 
+  build-and-push-image:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    needs:
+      - secret-scan
+      - source-security-scan
+
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@v4
+
       - name: Azure login with OIDC
         uses: azure/login@v2
         with:
@@ -49,7 +109,9 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Login to ACR
-        run: az acr login --name ${{ vars.ACR_NAME }}
+        run: |
+          set -euo pipefail
+          az acr login --name "${{ vars.ACR_NAME }}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,24 +122,58 @@ jobs:
           context: ./src/store-front
           push: true
           platforms: linux/amd64
-          tags: ${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}
+          tags: ${{ needs.validate-release-input.outputs.image_ref }}
 
-      - name: Container image vulnerability scan with Trivy
+      - name: Verify image tag in ACR
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ needs.validate-release-input.outputs.image_tag }}"
+
+          az acr repository show-tags \
+            --name "${{ vars.ACR_NAME }}" \
+            --repository store-front \
+            --output tsv | grep -Fx "${IMAGE_TAG}"
+
+          echo "Image tag exists in ACR: ${IMAGE_TAG}"
+
+  image-security-scan:
+    name: Image Security Scan
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+      - build-and-push-image
+
+    steps:
+      - name: Azure login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: |
+          set -euo pipefail
+          az acr login --name "${{ vars.ACR_NAME }}"
+
+      - name: Run Trivy container image scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}
+          image-ref: ${{ needs.validate-release-input.outputs.image_ref }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           format: table
           exit-code: "1"
 
-      - name: Verify image tag in ACR
-        run: |
-          az acr repository show-tags \
-            --name ${{ vars.ACR_NAME }} \
-            --repository store-front \
-            --output table
+  update-dev-gitops:
+    name: Update Dev GitOps
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+      - image-security-scan
 
+    steps:
       - name: Checkout GitOps repo
         uses: actions/checkout@v4
         with:
@@ -89,28 +185,75 @@ jobs:
       - name: Update Dev image tag in GitOps repo
         working-directory: gitops
         run: |
-          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/store-front:${{ github.event.inputs.image_tag }}"
+          set -euo pipefail
+
+          IMAGE="${{ needs.validate-release-input.outputs.image_ref }}"
           FILE="${{ vars.GITOPS_STORE_FRONT_FILE }}"
 
-          echo "Updating $FILE"
-          echo "New image: $IMAGE"
+          echo "Updating ${FILE}"
+          echo "New image: ${IMAGE}"
 
-          sed -i -E "s#image: .*/store-front:.*#image: ${IMAGE}#g" "$FILE"
+          if [[ ! -f "${FILE}" ]]; then
+            echo "GitOps file not found: ${FILE}"
+            exit 1
+          fi
+
+          sed -i -E "s#image: .*/store-front:.*#image: ${IMAGE}#g" "${FILE}"
 
           echo "Updated image line:"
-          grep -n "image: .*store-front" "$FILE"
+          grep -n "image: .*store-front" "${FILE}"
 
       - name: Commit and push GitOps change
         working-directory: gitops
         run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ needs.validate-release-input.outputs.image_tag }}"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           if git diff --quiet; then
-            echo "No GitOps changes to commit"
+            echo "No GitOps changes to commit. Dev already uses ${IMAGE_TAG}."
             exit 0
           fi
 
           git add "${{ vars.GITOPS_STORE_FRONT_FILE }}"
-          git commit -m "Deploy store-front ${{ github.event.inputs.image_tag }} to dev"
-          git push origin ${{ vars.GITOPS_BRANCH }}
+          git commit -m "Deploy store-front ${IMAGE_TAG} to dev"
+          git push origin "${{ vars.GITOPS_BRANCH }}"
+
+  build-and-dev-update-summary:
+    name: Build and Dev Update Summary
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+      - secret-scan
+      - source-security-scan
+      - build-and-push-image
+      - image-security-scan
+      - update-dev-gitops
+    if: always()
+
+    steps:
+      - name: Write build and Dev update summary
+        run: |
+          {
+            echo "# Store-front Dev Release Summary"
+            echo
+            echo "| Gate | Result | Purpose |"
+            echo "|---|---|---|"
+            echo "| Validate Release Input | ${{ needs.validate-release-input.result }} | Validates image tag and builds expected image reference |"
+            echo "| Secret Scan | ${{ needs.secret-scan.result }} | Scans repository for accidental secrets using Gitleaks |"
+            echo "| Source Security Scan | ${{ needs.source-security-scan.result }} | Scans store-front source/dependencies using Trivy |"
+            echo "| Build and Push Image | ${{ needs.build-and-push-image.result }} | Builds linux/amd64 image and pushes it to ACR |"
+            echo "| Image Security Scan | ${{ needs.image-security-scan.result }} | Scans the pushed container image using Trivy |"
+            echo "| Update Dev GitOps | ${{ needs.update-dev-gitops.result }} | Updates Dev GitOps desired state with the image tag |"
+            echo
+            echo "Image: ${{ needs.validate-release-input.outputs.image_ref }}"
+            echo
+            echo "Next expected actions:"
+            echo
+            echo "1. GitOps validation workflow runs in the GitOps repo."
+            echo "2. Argo CD syncs capstone-store-dev."
+            echo "3. Run the Dev release verification workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
