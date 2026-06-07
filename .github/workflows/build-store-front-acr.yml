@@ -1,4 +1,4 @@
-name: Build store-front image to ACR
+name: Legacy - Build store-front image to ACR
 
 on:
   workflow_dispatch:
