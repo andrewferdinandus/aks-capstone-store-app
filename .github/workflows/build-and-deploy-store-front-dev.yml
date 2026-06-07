@@ -90,8 +90,8 @@ jobs:
           format: table
           exit-code: "1"
 
-  build-and-push-image:
-    name: Build and Push Image
+  build-image:
+    name: Build Image
     runs-on: ubuntu-latest
     needs:
       - validate-release-input
@@ -101,6 +101,82 @@ jobs:
     steps:
       - name: Checkout app source
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build store-front image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: ./src/store-front
+          push: false
+          platforms: linux/amd64
+          tags: ${{ needs.validate-release-input.outputs.image_ref }}
+          outputs: type=docker,dest=/tmp/store-front-image.tar
+
+      - name: Upload built image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-front-image
+          path: /tmp/store-front-image.tar
+          retention-days: 1
+
+  image-security-scan:
+    name: Image Security Scan
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+      - build-image
+
+    steps:
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: store-front-image
+          path: /tmp
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+          trivy --version
+
+      - name: Scan built image before push
+        run: |
+          set -euo pipefail
+
+          trivy image \
+            --input /tmp/store-front-image.tar \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format table \
+            --exit-code 1
+
+  push-image-to-acr:
+    name: Push Image to ACR
+    runs-on: ubuntu-latest
+    needs:
+      - validate-release-input
+      - image-security-scan
+
+    steps:
+      - name: Download built image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: store-front-image
+          path: /tmp
 
       - name: Azure login with OIDC
         uses: azure/login@v2
@@ -114,16 +190,16 @@ jobs:
           set -euo pipefail
           az acr login --name "${{ vars.ACR_NAME }}"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Load and push scanned image
+        run: |
+          set -euo pipefail
 
-      - name: Build and push store-front image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./src/store-front
-          push: true
-          platforms: linux/amd64
-          tags: ${{ needs.validate-release-input.outputs.image_ref }}
+          IMAGE_REF="${{ needs.validate-release-input.outputs.image_ref }}"
+
+          docker load -i /tmp/store-front-image.tar
+
+          echo "Pushing scanned image: ${IMAGE_REF}"
+          docker push "${IMAGE_REF}"
 
       - name: Verify image tag in ACR
         run: |
@@ -138,41 +214,12 @@ jobs:
 
           echo "Image tag exists in ACR: ${IMAGE_TAG}"
 
-  image-security-scan:
-    name: Image Security Scan
-    runs-on: ubuntu-latest
-    needs:
-      - validate-release-input
-      - build-and-push-image
-
-    steps:
-      - name: Azure login with OIDC
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Login to ACR
-        run: |
-          set -euo pipefail
-          az acr login --name "${{ vars.ACR_NAME }}"
-
-      - name: Run Trivy container image scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ needs.validate-release-input.outputs.image_ref }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          format: table
-          exit-code: "1"
-
   update-dev-gitops:
     name: Update Dev GitOps
     runs-on: ubuntu-latest
     needs:
       - validate-release-input
-      - image-security-scan
+      - push-image-to-acr
 
     steps:
       - name: Checkout GitOps repo
@@ -230,8 +277,9 @@ jobs:
       - validate-release-input
       - secret-scan
       - source-security-scan
-      - build-and-push-image
+      - build-image
       - image-security-scan
+      - push-image-to-acr
       - update-dev-gitops
     if: always()
 
@@ -246,15 +294,23 @@ jobs:
             echo "| Validate Release Input | ${{ needs.validate-release-input.result }} | Validates image tag and builds expected image reference |"
             echo "| Secret Scan | ${{ needs.secret-scan.result }} | Scans repository for accidental secrets using Gitleaks |"
             echo "| Source Security Scan | ${{ needs.source-security-scan.result }} | Scans store-front source/dependencies using Trivy |"
-            echo "| Build and Push Image | ${{ needs.build-and-push-image.result }} | Builds linux/amd64 image and pushes it to ACR |"
-            echo "| Image Security Scan | ${{ needs.image-security-scan.result }} | Scans the pushed container image using Trivy |"
+            echo "| Build Image | ${{ needs.build-image.result }} | Builds the image locally without pushing it to ACR |"
+            echo "| Image Security Scan | ${{ needs.image-security-scan.result }} | Scans the built image before it is pushed |"
+            echo "| Push Image to ACR | ${{ needs.push-image-to-acr.result }} | Pushes only the scanned image to ACR |"
             echo "| Update Dev GitOps | ${{ needs.update-dev-gitops.result }} | Updates Dev GitOps desired state with the image tag |"
             echo
             echo "Image: ${{ needs.validate-release-input.outputs.image_ref }}"
             echo
+            echo "Security flow:"
+            echo
+            echo "1. Build image locally."
+            echo "2. Scan image before registry push."
+            echo "3. Push image to ACR only if scan passes."
+            echo "4. Update GitOps only after image exists in ACR."
+            echo
             echo "Next expected actions:"
             echo
-            echo "1. GitOps validation workflow runs in the GitOps repo."
+            echo "1. GitOps validation workflow runs in the GitOps repo if a new GitOps commit was pushed."
             echo "2. Argo CD syncs capstone-store-dev."
             echo "3. Run the Dev release verification workflow."
           } >> "$GITHUB_STEP_SUMMARY"
