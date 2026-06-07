@@ -230,6 +230,9 @@ jobs:
           token: ${{ secrets.GITOPS_REPO_TOKEN }}
           path: gitops
 
+      - name: Set up kubectl for Kustomize render
+        uses: azure/setup-kubectl@v4
+
       - name: Update Dev image tag in GitOps repo
         working-directory: gitops
         run: |
@@ -259,6 +262,26 @@ jobs:
             echo "Updated direct image line:"
             grep -n "image: .*store-front" "${FILE}"
           fi
+
+      - name: Verify rendered Dev image tag
+        working-directory: gitops
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ needs.validate-release-input.outputs.image_tag }}"
+          IMAGE_REF="${{ needs.validate-release-input.outputs.image_ref }}"
+          DEV_OVERLAY="apps/capstone-store/overlays/dev"
+
+          echo "Rendering Dev overlay: ${DEV_OVERLAY}"
+          kubectl kustomize "${DEV_OVERLAY}" > /tmp/dev-rendered.yaml
+
+          echo "Checking rendered store-front image..."
+          grep -n "image: ${IMAGE_REF}" /tmp/dev-rendered.yaml
+
+          echo "Checking rendered Dev namespace..."
+          grep -n "namespace: capstone-dev" /tmp/dev-rendered.yaml | head
+
+          echo "Rendered Dev overlay uses expected image tag: ${IMAGE_TAG}"
 
       - name: Commit and push GitOps change
         working-directory: gitops
